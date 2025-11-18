@@ -103,6 +103,7 @@ class DepthAnything3Net(nn.Module):
         intrinsics: torch.Tensor | None = None,
         export_feat_layers: list[int] | None = [],
         infer_gs: bool = False,
+        mask: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through the network.
@@ -112,6 +113,8 @@ class DepthAnything3Net(nn.Module):
             extrinsics: Camera extrinsics (B, N, 4, 4) - unused
             intrinsics: Camera intrinsics (B, N, 3, 3) - unused
             feat_layers: List of layer indices to extract features from
+            infer_gs: Enable 3D Gaussian Splatting inference
+            mask: Optional pixel mask (B, N, H, W) where True indicates pixels to ignore
 
         Returns:
             Dictionary containing predictions and auxiliary features
@@ -123,8 +126,24 @@ class DepthAnything3Net(nn.Module):
         else:
             cam_token = None
 
+        # Process mask for patch-level masking if provided
+        masks = None
+        if mask is not None:
+            # Convert pixel-level mask to patch-level mask
+            # mask shape: (B, N, H, W) -> need (B*N, num_patches)
+            B, N, H, W = mask.shape
+            patch_size = self.PATCH_SIZE
+            # Downsample mask to patch resolution using max pooling
+            # If any pixel in a patch is masked, mask the entire patch
+            import torch.nn.functional as F
+
+            mask_4d = mask.reshape(B * N, 1, H, W).float()
+            masks = F.max_pool2d(mask_4d, kernel_size=patch_size, stride=patch_size)
+            masks = masks.squeeze(1).bool()  # (B*N, H//patch_size, W//patch_size)
+            masks = masks.reshape(B * N, -1)  # (B*N, num_patches)
+
         feats, aux_feats = self.backbone(
-            x, cam_token=cam_token, export_feat_layers=export_feat_layers
+            x, cam_token=cam_token, export_feat_layers=export_feat_layers, masks=masks
         )
         # feats = [[item for item in feat] for feat in feats]
         H, W = x.shape[-2], x.shape[-1]

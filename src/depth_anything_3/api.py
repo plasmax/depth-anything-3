@@ -104,6 +104,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         intrinsics: torch.Tensor | None = None,
         export_feat_layers: list[int] | None = None,
         infer_gs: bool = False,
+        mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass through the model.
@@ -113,6 +114,8 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             extrinsics: Optional camera extrinsics with shape ``(B, N, 4, 4)``.
             intrinsics: Optional camera intrinsics with shape ``(B, N, 3, 3)``.
             export_feat_layers: Layer indices to return intermediate features for.
+            infer_gs: Enable 3D Gaussian Splatting inference.
+            mask: Optional pixel mask with shape ``(B, N, H, W)`` where True indicates pixels to ignore.
 
         Returns:
             Dictionary containing model predictions
@@ -121,7 +124,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         with torch.no_grad():
             with torch.autocast(device_type=image.device.type, dtype=autocast_dtype):
-                return self.model(image, extrinsics, intrinsics, export_feat_layers, infer_gs)
+                return self.model(image, extrinsics, intrinsics, export_feat_layers, infer_gs, mask)
 
     def inference(
         self,
@@ -138,6 +141,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         export_dir: str | None = None,
         export_format: str = "mini_npz",
         export_feat_layers: Sequence[int] | None = None,
+        mask: list[np.ndarray] | np.ndarray | None = None,
         # GLB export parameters
         conf_thresh_percentile: float = 40.0,
         num_max_points: int = 1_000_000,
@@ -164,6 +168,9 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             export_dir: Directory to export results
             export_format: Export format (mini_npz, npz, glb, ply, gs, gs_video)
             export_feat_layers: Layer indices to export intermediate features from
+            mask: Optional pixel masks (list of arrays or single array) with same length as images.
+                  Each mask should be a boolean array where True indicates pixels to ignore.
+                  Masks will be resized to match the processed image resolution.
             conf_thresh_percentile: [GLB] Lower percentile for adaptive confidence threshold (default: 40.0) # noqa: E501
             num_max_points: [GLB] Maximum number of points in the point cloud (default: 1,000,000)
             show_cameras: [GLB] Show camera wireframes in the exported scene (default: True)
@@ -181,8 +188,13 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             image, extrinsics, intrinsics, process_res, process_res_method
         )
 
+        # Preprocess mask if provided
+        mask_cpu = self._preprocess_mask(mask, imgs_cpu.shape) if mask is not None else None
+
         # Prepare tensors for model
-        imgs, ex_t, in_t = self._prepare_model_inputs(imgs_cpu, extrinsics, intrinsics)
+        imgs, ex_t, in_t, mask_t = self._prepare_model_inputs(
+            imgs_cpu, extrinsics, intrinsics, mask_cpu
+        )
 
         # Normalize extrinsics
         ex_t_norm = self._normalize_extrinsics(ex_t.clone() if ex_t is not None else None)
@@ -190,7 +202,9 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         # Run model forward pass
         export_feat_layers = list(export_feat_layers) if export_feat_layers is not None else []
 
-        raw_output = self._run_model_forward(imgs, ex_t_norm, in_t, export_feat_layers, infer_gs)
+        raw_output = self._run_model_forward(
+            imgs, ex_t_norm, in_t, export_feat_layers, infer_gs, mask_t
+        )
 
         # Convert raw output to prediction
         prediction = self._convert_to_prediction(raw_output)
@@ -269,12 +283,75 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         )
         return imgs_cpu, extrinsics, intrinsics
 
+    def _preprocess_mask(
+        self,
+        mask: list[np.ndarray] | np.ndarray,
+        target_shape: tuple,
+    ) -> torch.Tensor:
+        """Preprocess mask to match processed image shape.
+
+        Args:
+            mask: Input mask(s) - either a list of masks or a single array
+            target_shape: Target shape (N, C, H, W) from processed images
+
+        Returns:
+            Tensor of shape (N, H, W) with boolean values
+        """
+        import cv2
+
+        N, C, H, W = target_shape
+
+        # Convert mask to list if it's a single array
+        if isinstance(mask, np.ndarray):
+            if mask.ndim == 2:
+                # Single mask for single image
+                mask_list = [mask]
+            elif mask.ndim == 3:
+                # Multiple masks or single RGB mask
+                if mask.shape[0] == N:
+                    mask_list = [mask[i] for i in range(N)]
+                else:
+                    # Assume it's a single HxWxC mask, take first channel
+                    mask_list = [mask[:, :, 0] if mask.shape[2] > 1 else mask[:, :, 0]]
+            else:
+                raise ValueError(f"Unexpected mask shape: {mask.shape}")
+        else:
+            mask_list = mask
+
+        if len(mask_list) != N:
+            raise ValueError(
+                f"Number of masks ({len(mask_list)}) must match number of images ({N})"
+            )
+
+        # Resize each mask to match target resolution
+        processed_masks = []
+        for m in mask_list:
+            # Convert to boolean if needed
+            if m.dtype != bool:
+                m = m > 0
+
+            # Resize mask to match processed image size
+            if m.shape[:2] != (H, W):
+                # Resize using nearest neighbor to preserve boolean nature
+                m_resized = cv2.resize(
+                    m.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST
+                ).astype(bool)
+            else:
+                m_resized = m
+
+            processed_masks.append(m_resized)
+
+        # Stack into tensor (N, H, W)
+        mask_tensor = torch.from_numpy(np.stack(processed_masks, axis=0))
+        return mask_tensor
+
     def _prepare_model_inputs(
         self,
         imgs_cpu: torch.Tensor,
         extrinsics: torch.Tensor | None,
         intrinsics: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        mask_cpu: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """Prepare tensors for model input."""
         device = self._get_model_device()
 
@@ -293,7 +370,14 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             else None
         )
 
-        return imgs, ex_t, in_t
+        # Convert mask to tensor if provided
+        mask_t = (
+            mask_cpu.to(device, non_blocking=True)[None].bool()
+            if mask_cpu is not None
+            else None
+        )
+
+        return imgs, ex_t, in_t, mask_t
 
     def _normalize_extrinsics(self, ex_t: torch.Tensor | None) -> torch.Tensor | None:
         """Normalize extrinsics"""
@@ -342,6 +426,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         in_t: torch.Tensor | None,
         export_feat_layers: Sequence[int] | None = None,
         infer_gs: bool = False,
+        mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Run model forward pass."""
         device = imgs.device
@@ -350,7 +435,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             torch.cuda.synchronize(device)
         start_time = time.time()
         feat_layers = list(export_feat_layers) if export_feat_layers is not None else None
-        output = self.forward(imgs, ex_t, in_t, feat_layers, infer_gs)
+        output = self.forward(imgs, ex_t, in_t, feat_layers, infer_gs, mask)
         if need_sync:
             torch.cuda.synchronize(device)
         end_time = time.time()

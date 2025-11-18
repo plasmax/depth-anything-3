@@ -162,6 +162,8 @@ class DinoVisionTransformer(nn.Module):
             if num_register_tokens
             else None
         )
+        # Mask token for pixel masking functionality
+        self.mask_token = nn.Parameter(torch.zeros(1, embed_dim))
 
         if drop_path_uniform is True:
             dpr = [drop_path_rate] * depth
@@ -293,7 +295,7 @@ class DinoVisionTransformer(nn.Module):
 
     def _get_intermediate_layers_not_chunked(self, x, n=1, export_feat_layers=[], **kwargs):
         B, S, _, H, W = x.shape
-        x = self.prepare_tokens_with_masks(x)
+        x = self.prepare_tokens_with_masks(x, **kwargs)
         output, total_block_len, aux_output = [], len(self.blocks), []
         blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
         pos, pos_nodiff = self._prepare_rope(B, S, H, W, x.device)
